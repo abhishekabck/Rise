@@ -5,7 +5,6 @@ import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Task } from '../types';
 import TaskInput from './TaskInput';
 import { motion, AnimatePresence } from 'motion/react';
-import { timerService } from '../lib/timerService';
 
 interface TasksPageProps {
   userId: string;
@@ -52,49 +51,6 @@ export default function TasksPage({
   const handleUpdateStatus = async (taskId: string | undefined, newStatus: Task['status'], taskTitle: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!taskId) return;
-
-    if (newStatus === 'abandoned') {
-      try {
-        await timerService.skipTask(userId, taskId);
-        setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: 'abandoned' } : t)));
-        const task = tasks.find(t => t.id === taskId);
-        if (task) {
-           await timerService.updateBehaviorStats(userId, 'abandoned', task.category, 0, tasks.length);
-        }
-        triggerAutonomousAgent(`Skipped task "${taskTitle}" (marked as abandoned)`, 'skipped', task?.priority);
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
-      }
-      return;
-    }
-
-    if (newStatus === 'completed') {
-      try {
-        const actualMinutes = await timerService.completeTask(userId, taskId);
-        setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: 'completed', actualMinutes } : t)));
-        const task = tasks.find(t => t.id === taskId);
-        if (task) {
-           await timerService.updateBehaviorStats(userId, 'completed', task.category, actualMinutes, tasks.length);
-        }
-        triggerAutonomousAgent(`Completed task "${taskTitle}"`, 'completed', task?.priority);
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
-      }
-      return;
-    }
-
-    if (newStatus === 'in_progress') {
-      try {
-        timerService.setUserId(userId);
-        await timerService.startTask(userId, taskId, taskTitle);
-        setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: 'in_progress' } : t)));
-        triggerAutonomousAgent(`Started focusing on task "${taskTitle}"`, 'updated');
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
-      }
-      return;
-    }
-
     const taskRef = doc(db, `users/${userId}/tasks`, taskId);
     const updatedFields: Partial<Task> = { 
       status: newStatus,

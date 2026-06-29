@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User profile with preferences",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "preferences": {
+          "type": "object",
+          "properties": {
+            "tone": { "type": "string", "enum": ["casual", "formal", "motivational"] },
+            "notificationEmail": { "type": "string" }
+          }
+        }
+      },
+      "required": ["email", "name", "createdAt"]
+    },
+    "Task": {
+      "title": "User Task",
+      "description": "A task with AI metrics and scheduling",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "priority": { "type": "string", "enum": ["low", "medium", "high"] },
+        "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "abandoned"] },
+        "estimatedMinutes": { "type": "number" },
+        "actualMinutes": { "type": "number" },
+        "scheduledAt": { "type": "string" },
+        "completedAt": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "category": { "type": "string", "enum": ["coding", "writing", "admin", "meeting", "learning", "other"] },
+        "deadline": { "type": "string" },
+        "difficulty": { "type": "string", "enum": ["easy", "medium", "hard"] },
+        "recurring": { "type": "string", "enum": ["one-time", "daily", "weekly", "monthly"] }
+      },
+      "required": ["title", "status", "createdAt"]
+    },
+    "BehaviorDaily": {
+      "title": "Daily Behavior Metrics",
+      "description": "Aggregated productivity data for a single day",
+      "type": "object",
+      "properties": {
+        "tasksCompleted": { "type": "number" },
+        "tasksAbandoned": { "type": "number" },
+        "avgCompletionTime": { "type": "number" },
+        "peakHours": { "type": "array" },
+        "preferredCategories": { "type": "array" },
+        "abandonedCategories": { "type": "array" },
+        "completionRate": { "type": "number" }
+      },
+      "required": ["tasksCompleted", "tasksAbandoned"]
+    },
+    "BehaviorProfile": {
+      "title": "Aesthetic Profile",
+      "description": "AI-generated user behavior insights",
+      "type": "object",
+      "properties": {
+        "summary": { "type": "string" },
+        "strengths": { "type": "array" },
+        "weaknesses": { "type": "array" },
+        "peakProductivityHours": { "type": "array" },
+        "averageTaskDuration": { "type": "number" },
+        "completionRate": { "type": "number" },
+        "lastUpdated": { "type": "string" }
+      },
+      "required": ["summary", "lastUpdated"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "Core profile for the registered user"
+    },
+    "users/{userId}/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "Individual task tracking with times"
+    },
+    "users/{userId}/behavior/{date}": {
+      "schema": "BehaviorDaily",
+      "description": "Productivity data aggregates logged daily"
+    },
+    "users/{userId}/behaviorProfile": {
+      "schema": "BehaviorProfile",
+      "description": "Comprehensive continuous profile analysis"
+    }
+  }
+}

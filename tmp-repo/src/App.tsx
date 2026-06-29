@@ -803,7 +803,6 @@ export default function App() {
           recipientEmail: userProfile?.preferences?.notificationEmail || user.email,
           accessToken: googleToken,
           userId: user.uid,
-          userName: userProfile?.name || user.displayName || 'User',
         }),
       });
       if (res.ok) {

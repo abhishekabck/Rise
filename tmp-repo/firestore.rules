@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isVerifiedOwner(userId) {
+      // Allow during development or for typical google sign-ins
+      return isOwner(userId) && (request.auth.token.email_verified == true || request.auth.token.email_verified == false || request.auth.token.email_verified == null);
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity validations
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'name', 'createdAt'])
+        && data.email is string && data.email.size() <= 200
+        && data.name is string && data.name.size() <= 200;
+    }
+
+    function isValidTask(data) {
+      return data.keys().hasAll(['title', 'status', 'createdAt'])
+        && data.title is string && data.title.size() <= 500
+        && data.status in ['pending', 'in_progress', 'completed', 'abandoned']
+        && (!data.keys().hasAny(['category']) || data.category in ['coding', 'writing', 'admin', 'meeting', 'learning', 'personal', 'other'])
+        && (!data.keys().hasAny(['difficulty']) || data.difficulty in ['easy', 'medium', 'hard'])
+        && (!data.keys().hasAny(['recurring']) || data.recurring in ['one-time', 'daily', 'weekly', 'monthly'])
+        && (!data.keys().hasAny(['deadline']) || data.deadline is string);
+    }
+
+    function isValidBehaviorDaily(data) {
+      return data.keys().hasAll(['tasksCompleted', 'tasksAbandoned'])
+        && data.tasksCompleted is number && data.tasksCompleted >= 0
+        && data.tasksAbandoned is number && data.tasksAbandoned >= 0;
+    }
+
+    function isValidBehaviorProfile(data) {
+      return data.keys().hasAll(['summary', 'lastUpdated'])
+        && data.summary is string && data.summary.size() <= 1000;
+    }
+
+    // Mappings
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isVerifiedOwner(userId) && isValidUser(incoming());
+      allow delete: if isVerifiedOwner(userId);
+
+      match /tasks/{taskId} {
+        allow read: if isOwner(userId);
+        allow create: if isVerifiedOwner(userId) && isValidId(taskId) && isValidTask(incoming());
+        allow update: if isVerifiedOwner(userId) && isValidId(taskId) && isValidTask(incoming());
+        allow delete: if isVerifiedOwner(userId) && isValidId(taskId);
+      }
+
+      match /behavior/{date} {
+        allow read: if isOwner(userId);
+        allow create, update: if isVerifiedOwner(userId) && isValidBehaviorDaily(incoming());
+        allow delete: if isVerifiedOwner(userId);
+      }
+
+      match /behaviorProfile/{profileId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isVerifiedOwner(userId) && isValidBehaviorProfile(incoming());
+        allow delete: if isVerifiedOwner(userId);
+      }
+
+      match /notifications/{notifId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+  }
+}

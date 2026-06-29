@@ -55,108 +55,10 @@ const isRateLimitError = (e: any) => e?.status === 429 ||
     e.message.toLowerCase().includes('quota') ||
     e.message.toLowerCase().includes('rate limit')));
 
-async function sendGmail(accessToken: string, to: string, subject: string, body: string, userName: string = 'User') {
-  const htmlBody = `
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-  body {
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
-    background-color: #0f172a;
-    color: #f8fafc;
-    margin: 0;
-    padding: 0;
-    line-height: 1.6;
-  }
-  .container {
-    max-width: 600px;
-    margin: 40px auto;
-    background-color: #1e293b;
-    border-radius: 16px;
-    padding: 32px;
-    border: 1px solid #334155;
-    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
-  }
-  .header {
-    margin-bottom: 24px;
-    border-bottom: 1px solid #334155;
-    padding-bottom: 16px;
-    display: flex;
-    align-items: center;
-  }
-  .logo {
-    background-color: #3b82f6;
-    color: white;
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: bold;
-    font-size: 18px;
-    margin-right: 12px;
-  }
-  .app-name {
-    font-size: 20px;
-    font-weight: 600;
-    letter-spacing: -0.02em;
-    color: white;
-  }
-  .title {
-    font-size: 24px;
-    font-weight: 700;
-    margin: 0 0 16px 0;
-    color: #f8fafc;
-  }
-  .greeting {
-    font-size: 16px;
-    color: #cbd5e1;
-    margin-bottom: 16px;
-  }
-  .message-body {
-    background-color: #0f172a;
-    padding: 20px;
-    border-radius: 12px;
-    border: 1px solid #334155;
-    color: #e2e8f0;
-    white-space: pre-wrap;
-    font-size: 15px;
-  }
-  .footer {
-    margin-top: 32px;
-    font-size: 13px;
-    color: #64748b;
-    text-align: center;
-  }
-</style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div class="logo">R</div>
-      <div class="app-name">Rise</div>
-    </div>
-    <h1 class="title">${subject}</h1>
-    <div class="greeting">Hello ${userName},</div>
-    <div class="message-body">${body}</div>
-    <div class="footer">
-      This is an automated notification from your Rise Proactive AI Agent.<br>
-      Stay focused and have a productive day!
-    </div>
-  </div>
-</body>
-</html>
-  `;
-
+async function sendGmail(accessToken: string, to: string, subject: string, body: string) {
   const raw = Buffer.from([
-    `To: ${to}`, 
-    `Subject: =?utf-8?B?${Buffer.from(subject).toString('base64')}?=`,
-    'Content-Type: text/html; charset=utf-8', 
-    'MIME-Version: 1.0', 
-    '', 
-    htmlBody,
+    `To: ${to}`, `Subject: ${subject}`,
+    'Content-Type: text/plain; charset=utf-8', 'MIME-Version: 1.0', '', body,
   ].join('\r\n')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',
@@ -827,7 +729,7 @@ app.post('/api/autonomous-agent', async (req, res) => {
     // If notification required and recipientEmail + accessToken are available, send the email!
     if (recipientEmail && accessToken) {
       try {
-        await sendGmail(accessToken, recipientEmail, data.notificationSubject, data.notificationMessage, req.body.userName || 'User');
+        await sendGmail(accessToken, recipientEmail, data.notificationSubject, data.notificationMessage);
         console.log(`Autonomous Notification email successfully sent to ${recipientEmail}`);
       } catch (err) {
         console.error('Error sending autonomous email notification:', err);
@@ -854,7 +756,7 @@ app.post('/api/autonomous-agent', async (req, res) => {
 // API: Send Custom Email Notification (Fresh generated via Gemini)
 app.post('/api/smart-notify', async (req, res) => {
   try {
-    const { urgency, tone, taskTitle, recipientEmail, accessToken, userName } = req.body;
+    const { urgency, tone, taskTitle, recipientEmail, accessToken } = req.body;
 
     if (!recipientEmail || !accessToken) {
       return res.status(400).json({ error: 'recipientEmail and Google accessToken are required' });
@@ -887,7 +789,7 @@ app.post('/api/smart-notify', async (req, res) => {
     const data = parseGeminiText(response.text);
 
     // Send email using Gmail API
-    await sendGmail(accessToken, recipientEmail, data.subject, data.body, userName || 'User');
+    await sendGmail(accessToken, recipientEmail, data.subject, data.body);
     res.json({ success: true, email: data });
   } catch (error: any) {
     if (isRateLimitError(error)) {

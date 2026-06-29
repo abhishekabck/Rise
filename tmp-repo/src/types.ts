@@ -27,7 +27,6 @@ export interface Task {
   difficulty?: 'easy' | 'medium' | 'hard';
   recurring?: 'one-time' | 'daily' | 'weekly' | 'monthly';
   aiAnalyzed?: boolean;
-  order?: number;
 }
 
 export interface BehaviorDaily {

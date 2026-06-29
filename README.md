@@ -8,6 +8,15 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/1bd22fde-db3a-4c33-8fbe-2a36590ce94a
 
+## Features
+- **Intelligent Task Management**: Add, organize, and track tasks with AI-driven categorization and prioritization.
+- **Proactive AI Agent**: Background agent that monitors your work patterns, prevents stalling, and suggests schedule optimizations.
+- **Google Calendar Integration**: Sync your tasks with Google Calendar to manage your time seamlessly.
+- **Voice Assistant**: Add tasks, check schedules, and control the app hands-free using voice commands.
+- **Behavior Profiling**: Deep analytics on your productivity trends, peak hours, and completion rates.
+- **Dark/Light Mode**: Full theme support for comfortable day and night usage.
+- **Focus Timer**: Built-in timer to track active working sessions and sync offline progress.
+
 ## Run Locally
 
 **Prerequisites:**  Node.js

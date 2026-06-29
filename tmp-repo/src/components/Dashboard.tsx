@@ -11,13 +11,12 @@ import {
   Target, 
   RefreshCw,
   TrendingUp,
-  Award,
-  GripVertical
+  Award
 } from 'lucide-react';
-import { doc, updateDoc, setDoc, getDoc, collection, onSnapshot, query, orderBy, where, writeBatch } from 'firebase/firestore';
+import { doc, updateDoc, setDoc, getDoc, collection, onSnapshot, query, orderBy, where } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Task, BehaviorDaily, BehaviorProfile } from '../types';
-import { motion, AnimatePresence, Reorder } from 'motion/react';
+import { motion, AnimatePresence } from 'motion/react';
 import { timerService } from '../lib/timerService';
 import TaskInput from './TaskInput';
 
@@ -58,8 +57,6 @@ export default function Dashboard({
   const [subtasks, setSubtasks] = useState<any[]>([]);
   const [loadingSubtasks, setLoadingSubtasks] = useState(false);
 
-  const [highPriorityQueue, setHighPriorityQueue] = useState<Task[]>([]);
-
   // Filter pending/in-progress tasks and find the highest priority one
   const pendingTasks = tasks.filter((t) => t.status === 'pending' || t.status === 'in_progress');
   const completedTasksToday = tasks.filter((t) => t.status === 'completed');
@@ -80,50 +77,12 @@ export default function Dashboard({
 
     const scoreDiff = getPriorityScore(b.priority) - getPriorityScore(a.priority);
     if (scoreDiff !== 0) return scoreDiff;
-    
-    if (typeof a.order === 'number' && typeof b.order === 'number') {
-      return a.order - b.order;
-    }
-    if (typeof a.order === 'number') return -1;
-    if (typeof b.order === 'number') return 1;
-
     return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
   });
 
   const currentTaskToShow = selectedTaskId 
     ? tasks.find(t => t.id === selectedTaskId && (t.status === 'pending' || t.status === 'in_progress')) || sortedPendingTasks[0] || null
     : sortedPendingTasks[0] || null;
-
-  useEffect(() => {
-    // Top 3 high priority tasks (excluding the one currently active if desired, but we'll include all to let user re-order)
-    const topHigh = sortedPendingTasks.filter(t => t.priority === 'high').slice(0, 3);
-    
-    // Only update if IDs differ to prevent breaking ongoing drag
-    if (topHigh.map(t => t.id).join(',') !== highPriorityQueue.map(t => t.id).join(',')) {
-      setHighPriorityQueue(topHigh);
-    } else {
-      // Just update data but keep current array identity stable if possible, or just set it:
-      // We will set it anyway to reflect completed/started status, but it might interrupt drag if it happens mid-drag.
-      // Usually tasks only update when user interacts.
-      setHighPriorityQueue(topHigh);
-    }
-  }, [tasks]);
-
-  const handleHighPriorityReorder = async (newOrder: Task[]) => {
-    setHighPriorityQueue(newOrder);
-    try {
-      const batch = writeBatch(db);
-      newOrder.forEach((task, index) => {
-        if (task.id) {
-          const taskRef = doc(db, 'users', userId, 'tasks', task.id);
-          batch.update(taskRef, { order: index });
-        }
-      });
-      await batch.commit();
-    } catch (err) {
-      console.error('Failed to update task order:', err);
-    }
-  };
 
   // Real-time subtasks listener
   useEffect(() => {
@@ -760,62 +719,49 @@ export default function Dashboard({
             )}
           </AnimatePresence>
 
-          {/* High Priority Queue Section */}
-          {highPriorityQueue.length > 0 && !timerRunning && (
+          {/* Next Up In Your Queue Section */}
+          {sortedPendingTasks.length > 1 && !timerRunning && (
             <div className="text-left mt-10">
-              <h4 className="text-[10px] font-extrabold tracking-[1.5px] uppercase text-text-muted mb-4 font-mono flex items-center gap-2">
-                <Target className="w-3.5 h-3.5 text-accent-red" />
-                Top High Priority Tasks (Drag to Re-rank)
+              <h4 className="text-[10px] font-extrabold tracking-[1.5px] uppercase text-text-muted mb-4 font-mono">
+                Next Up in your Queue
               </h4>
-              <Reorder.Group axis="y" values={highPriorityQueue} onReorder={handleHighPriorityReorder} className="space-y-3">
-                {highPriorityQueue.map((task) => (
-                  <Reorder.Item
+              <div className="space-y-3">
+                {sortedPendingTasks.slice(1, 4).map((task) => (
+                  <div
                     key={task.id}
-                    value={task}
-                    className="p-4 bg-bg-card border-[1.5px] border-border-main rounded flex justify-between items-center hover:shadow-sm transition-all duration-150 cursor-grab active:cursor-grabbing relative bg-bg-primary/50"
+                    onClick={() => setSelectedTaskId(task.id || null)}
+                    className="p-4 bg-bg-card border-[1.5px] border-border-main rounded flex justify-between items-center hover:-translate-y-0.5 hover:shadow-sm transition-all duration-150 cursor-pointer"
                   >
-                    <div className="flex items-center gap-3 w-full pr-4">
-                      <div className="text-text-muted cursor-grab active:cursor-grabbing">
-                        <GripVertical className="w-5 h-5" />
-                      </div>
-                      <div 
-                        className="flex flex-col gap-1.5 min-w-0 text-left flex-1"
-                        onClick={(e) => {
-                          // Prevent click from interfering with drag if we just wanted to select
-                          // but usually framer-motion handles this.
-                          setSelectedTaskId(task.id || null);
-                        }}
-                      >
-                        <p className="text-[16px] font-bold text-text-primary leading-tight truncate font-sans">{task.title}</p>
-                        <div className="flex items-center gap-2">
-                          {task.aiAnalyzed === false ? (
-                            <span 
-                              title="AI insights will be added when available"
-                              className="text-[8px] font-extrabold tracking-[0.5px] uppercase px-2 py-0.5 rounded border-[1.5px] border-border-main text-text-muted bg-bg-subtle flex items-center gap-1 font-mono"
-                            >
-                              <Clock className="w-2.5 h-2.5 text-text-muted animate-spin" />
-                              AI pending
+                    <div className="flex flex-col gap-1.5 pr-4 min-w-0 text-left">
+                      <p className="text-[16px] font-bold text-text-primary leading-tight truncate font-sans">{task.title}</p>
+                      <div className="flex items-center gap-2">
+                        {task.aiAnalyzed === false ? (
+                          <span 
+                            title="AI insights will be added when available"
+                            className="text-[8px] font-extrabold tracking-[0.5px] uppercase px-2 py-0.5 rounded border-[1.5px] border-border-main text-text-muted bg-bg-subtle flex items-center gap-1 font-mono"
+                          >
+                            <Clock className="w-2.5 h-2.5 text-text-muted animate-spin" />
+                            AI pending
+                          </span>
+                        ) : (
+                          <>
+                            <span className={`text-[8px] font-extrabold tracking-[0.5px] uppercase px-2 py-0.5 rounded border-[1.5px] font-mono ${getCategoryBadgeStyles(task.category).classes}`}>
+                              {getCategoryBadgeStyles(task.category).label}
                             </span>
-                          ) : (
-                            <>
-                              <span className={`text-[8px] font-extrabold tracking-[0.5px] uppercase px-2 py-0.5 rounded border-[1.5px] font-mono ${getCategoryBadgeStyles(task.category).classes}`}>
-                                {getCategoryBadgeStyles(task.category).label}
-                              </span>
-                              <span className={`text-[8px] font-extrabold tracking-[0.5px] uppercase px-2 py-0.5 rounded border-[1.5px] font-mono ${priorityColors[task.priority]}`}>
-                                {task.priority}
-                              </span>
-                            </>
-                          )}
-                        </div>
+                            <span className={`text-[8px] font-extrabold tracking-[0.5px] uppercase px-2 py-0.5 rounded border-[1.5px] font-mono ${priorityColors[task.priority]}`}>
+                              {task.priority}
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5 text-xs text-text-muted font-bold shrink-0 font-mono">
                       <Clock className="w-3.5 h-3.5 text-text-muted" />
                       <span>{task.estimatedMinutes}m</span>
                     </div>
-                  </Reorder.Item>
+                  </div>
                 ))}
-              </Reorder.Group>
+              </div>
             </div>
           )}
 
