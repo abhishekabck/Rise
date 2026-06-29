@@ -1,0 +1,6 @@
+{
+  "name": "Rise",
+  "description": "An AI-powered personal productivity companion that learns user behavior patterns to help them compete against their past self, featuring Google Calendar and Gmail integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
