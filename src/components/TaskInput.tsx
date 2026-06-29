@@ -4,6 +4,8 @@ import { addDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Task, BehaviorProfile } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
+import { detectCategoryFast, parseDeadlineFast, estimateMinutesFast } from '../lib/deterministicChecks';
+import { guardian } from '../lib/quotaGuardian';
 
 interface TaskInputProps {
   userId: string;
@@ -152,21 +154,27 @@ export default function TaskInput({ userId, behaviorProfile, onTaskAdded, trigge
 
   const [contextIssues, setContextIssues] = useState<any[]>([]);
   const [bypassWarnings, setBypassWarnings] = useState(false);
+  const [successMessage, setSuccessMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
 
   const handleAddTask = async (e?: React.FormEvent, forceAdd = false) => {
     if (e) e.preventDefault();
     if (!title.trim()) return;
 
+    const capturedTitle = title.trim();
     setAnalyzing(true);
+    setErrorMessage('');
+
     try {
-      // 1. Context Analysis & Pattern/Duplicate Detection (Non-blocking try-catch)
-      if (contextIssues.length === 0 && !forceAdd) {
+      // 1. Context Analysis & Pattern/Duplicate Detection (Non-blocking, only show critical issues)
+      if (contextIssues.length === 0 && !forceAdd && guardian.shouldAllow('analyzeContext')) {
         try {
+          guardian.recordCall('analyzeContext');
           const contextRes = await fetch('/api/tasks/analyze-context', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              newTaskTitle: title,
+              newTaskTitle: capturedTitle,
               newTaskDescription: description,
               userId,
               behaviorProfile
@@ -174,10 +182,14 @@ export default function TaskInput({ userId, behaviorProfile, onTaskAdded, trigge
           });
           if (contextRes.ok) {
             const contextData = await contextRes.json();
-            if (contextData.issues && contextData.issues.length > 0) {
+            // Only block on critical severity issues (e.g. exact duplicates)
+            const criticalIssues = (contextData.issues || []).filter(
+              (issue: any) => issue.severity === 'critical'
+            );
+            if (criticalIssues.length > 0) {
               setContextIssues(contextData.issues);
               setAnalyzing(false);
-              return; // Halt and show warnings to user
+              return;
             }
           }
         } catch (contextErr) {
@@ -185,32 +197,50 @@ export default function TaskInput({ userId, behaviorProfile, onTaskAdded, trigge
         }
       }
 
-      // Determine initial Category
-      const resolvedCategory = (category !== 'auto' ? category : 'other') as Task['category'];
+      // Determine initial Category — fast deterministic detection before calling AI
+      const fastCategory = category !== 'auto' ? null : detectCategoryFast(capturedTitle);
+      const resolvedCategory = (category !== 'auto' ? category : (fastCategory || 'other')) as Task['category'];
 
-      // 2. Prepare task record immediately with defaults and mark aiAnalyzed: false
+      // Fast deadline parse from title (e.g. "by tomorrow", "by friday")
+      const fastDeadline = !deadline ? parseDeadlineFast(capturedTitle) : null;
+      const resolvedDeadline = deadline || (fastDeadline ? fastDeadline.toISOString() : null);
+
+      // Fast minute estimate (used as default; AI will refine if quota allows)
+      const fastMinutes = estimateMinutesFast(difficulty, resolvedCategory);
+
+      // 2. Prepare task record immediately with defaults
+      // Note: Firestore rejects `undefined` values — conditionally include deadline
       const newTaskData: Omit<Task, 'id'> = {
-        title,
+        title: capturedTitle,
         description,
         priority: 'medium',
         status: 'pending',
-        estimatedMinutes: 30,
+        estimatedMinutes: fastMinutes,
         actualMinutes: 0,
         createdAt: new Date().toISOString(),
         category: resolvedCategory,
-        deadline: deadline || undefined,
+        ...(resolvedDeadline ? { deadline: resolvedDeadline } : {}),
         difficulty,
         recurring: isRecurring ? 'daily' : 'one-time',
-        aiAnalyzed: false, // background AI enrichment indicator
-      };
+        // Mark as rule-based if fast detection found category; false means AI enrichment pending
+        aiAnalyzed: fastCategory ? 'rule-based' : false,
+      } as any;
 
       // 3. Write task to Firestore
       const path = `users/${userId}/tasks`;
       let docRef;
       try {
         docRef = await addDoc(collection(db, path), newTaskData);
-      } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, path);
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        const isOffline = errMsg.toLowerCase().includes('offline') || errMsg.toLowerCase().includes('unavailable');
+        if (!isOffline) {
+          console.error('[TaskInput] Firestore write failed:', errMsg);
+          setErrorMessage('Failed to save task. Please try again.');
+          setAnalyzing(false);
+          return;
+        }
+        console.warn('[TaskInput] Offline — task queued locally by Firestore SDK');
       }
 
       const taskWithId: Task = {
@@ -227,15 +257,20 @@ export default function TaskInput({ userId, behaviorProfile, onTaskAdded, trigge
       setIsRecurring(false);
       setIsExpanded(false);
       setContextIssues([]);
-      
+
+      // Show success toast
+      setSuccessMessage(`"${capturedTitle}" added!`);
+      setTimeout(() => setSuccessMessage(''), 3000);
+
       // Callback (adds instantly to UI)
       onTaskAdded(taskWithId);
 
-      // Trigger Autonomous Agent immediately for basic action
-      triggerAutonomousAgent(`Added task "${title}" (AI calibration running in background)`, 'added');
+      // Trigger Autonomous Agent
+      triggerAutonomousAgent(`Added task "${capturedTitle}" (AI calibration running in background)`, 'added');
 
     } catch (err) {
-      console.error('Error adding task:', err);
+      console.error('[TaskInput] Unexpected error adding task:', err);
+      setErrorMessage('Something went wrong. Please try again.');
     } finally {
       setAnalyzing(false);
     }
@@ -484,6 +519,35 @@ export default function TaskInput({ userId, behaviorProfile, onTaskAdded, trigge
                   Adjust details
                 </button>
               </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Error message */}
+        <AnimatePresence>
+          {errorMessage && (
+            <motion.div
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              className="p-3 bg-accent-red-light/30 border border-accent-red/30 rounded text-xs text-accent-red font-mono"
+            >
+              {errorMessage}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Success toast */}
+        <AnimatePresence>
+          {successMessage && (
+            <motion.div
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              className="p-3 bg-accent-green-light/30 border border-accent-green/30 rounded text-xs text-accent-green font-mono flex items-center gap-2"
+            >
+              <RotateCw className="w-3 h-3 animate-spin text-accent-green" />
+              <span>{successMessage} AI enriching in background...</span>
             </motion.div>
           )}
         </AnimatePresence>

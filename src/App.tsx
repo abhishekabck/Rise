@@ -36,6 +36,12 @@ export interface InAppNotification {
   read: boolean;
 }
 
+const DEFAULT_NOTIFICATIONS: InAppNotification[] = [
+  { id: 'notif-1', type: 'ai', title: 'Adaptive Strategy Ready', message: 'Rise analyzed your coding patterns and recommends starting your coding focus block 15 mins earlier today.', timestamp: '10m ago', read: false },
+  { id: 'notif-2', type: 'success', title: 'Daily Streak Achieved!', message: 'Congratulations! You have hit a 4-day focus streak. Keep up the momentum!', timestamp: '2h ago', read: false },
+  { id: 'notif-3', type: 'high', title: 'High Priority Task Due', message: '"Product Strategy Review" is scheduled soon. Make sure to review the calibration details.', timestamp: '4h ago', read: true },
+];
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
 
@@ -58,12 +64,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    const root = window.document.documentElement;
-    if (themeMode === 'dark') {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
-    }
+    document.documentElement.classList.toggle('dark', themeMode === 'dark');
     localStorage.setItem('rise_theme', themeMode);
   }, [themeMode]);
 
@@ -89,40 +90,17 @@ export default function App() {
           ...doc.data()
         })) as Task[];
 
-        // Group by lowercase title
-        const groups: { [key: string]: Task[] } = {};
-        allTasks.forEach(task => {
-          if (!task.title) return;
-          const key = task.title.toLowerCase().trim();
-          if (!groups[key]) {
-            groups[key] = [];
-          }
-          groups[key].push(task);
-        });
+        const groups = allTasks.filter(t => t.title).reduce<Record<string, Task[]>>((acc, t) => {
+          const k = t.title.toLowerCase().trim();
+          (acc[k] ??= []).push(t);
+          return acc;
+        }, {});
 
-        // For each group with 2+ tasks, keep the oldest and delete others
-        for (const key in groups) {
-          const group = groups[key];
-          if (group.length > 1) {
-            // Sort by createdAt (oldest first)
-            group.sort((a, b) => {
-              const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-              const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-              return aTime - bTime;
-            });
-
-            // Keep the first (oldest) one, delete others
-            const oldest = group[0];
-            const toDelete = group.slice(1);
-
-            console.log(`[Cleanup] Found duplicate group for "${oldest.title}": keeping oldest (${oldest.id}), deleting ${toDelete.length} duplicates.`);
-
-            for (const task of toDelete) {
-              if (task.id) {
-                await deleteDoc(doc(db, `users/${user.uid}/tasks`, task.id));
-              }
-            }
-          }
+        for (const group of Object.values(groups).filter(g => g.length > 1)) {
+          group.sort((a, b) => (a.createdAt ? new Date(a.createdAt).getTime() : 0) - (b.createdAt ? new Date(b.createdAt).getTime() : 0));
+          const [oldest, ...toDelete] = group;
+          console.log(`[Cleanup] Found duplicate group for "${oldest.title}": keeping oldest (${oldest.id}), deleting ${toDelete.length} duplicates.`);
+          await Promise.all(toDelete.filter(t => t.id).map(t => deleteDoc(doc(db, `users/${user.uid}/tasks`, t.id!))));
         }
         console.log('[Cleanup] Duplicate cleanup complete.');
       } catch (err) {
@@ -149,32 +127,7 @@ export default function App() {
   // Notifications Sidebar
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
-  const [notifications, setNotifications] = useState<InAppNotification[]>([
-    {
-      id: 'notif-1',
-      type: 'ai',
-      title: 'Adaptive Strategy Ready',
-      message: 'Rise analyzed your coding patterns and recommends starting your coding focus block 15 mins earlier today.',
-      timestamp: '10m ago',
-      read: false,
-    },
-    {
-      id: 'notif-2',
-      type: 'success',
-      title: 'Daily Streak Achieved!',
-      message: 'Congratulations! You have hit a 4-day focus streak. Keep up the momentum!',
-      timestamp: '2h ago',
-      read: false,
-    },
-    {
-      id: 'notif-3',
-      type: 'high',
-      title: 'High Priority Task Due',
-      message: '"Product Strategy Review" is scheduled soon. Make sure to review the calibration details.',
-      timestamp: '4h ago',
-      read: true,
-    },
-  ]);
+  const [notifications, setNotifications] = useState<InAppNotification[]>(DEFAULT_NOTIFICATIONS);
 
   const markAllNotificationsRead = async () => {
     setNotifications(prev => prev.map(n => ({ ...n, read: true })));
@@ -310,19 +263,9 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
-    // Refresh immediately on load
-    getValidGoogleToken().then((token) => {
-      if (token) {
-        setGoogleToken(token);
-      }
-    });
-
-    const refreshInterval = setInterval(async () => {
-      const token = await getValidGoogleToken();
-      if (token) {
-        setGoogleToken(token);
-      }
-    }, 50 * 60 * 1000); // 50 minutes
+    const refresh = () => getValidGoogleToken().then(t => t && setGoogleToken(t));
+    refresh();
+    const refreshInterval = setInterval(refresh, 50 * 60 * 1000);
 
     return () => clearInterval(refreshInterval);
   }, [user]);
@@ -411,12 +354,7 @@ export default function App() {
         const hours = Math.floor(totalSecs / 3600);
         const mins = Math.floor((totalSecs % 3600) / 60);
         
-        let text = '';
-        if (hours > 0) {
-          text += `${hours}h ${mins}m`;
-        } else {
-          text += `${mins}m`;
-        }
+        const text = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
         setAwayDurationText(text);
         setAwayMinutes(Math.max(1, Math.round(diffMs / 60000)));
         setShowAwayModal(true);
@@ -503,36 +441,22 @@ export default function App() {
     // 1. Fetch or create User Profile
     const fetchProfile = async () => {
       const userRef = doc(db, 'users', user.uid);
+      const initialProfile: UserProfile = {
+        email: user.email || '',
+        name: user.displayName || 'Rise Companion',
+        photoURL: user.photoURL || '',
+        createdAt: new Date().toISOString(),
+        preferences: { tone: 'casual', notificationEmail: user.email || '' }
+      };
       try {
         const docSnap = await getDoc(userRef);
         if (docSnap.exists()) {
           setUserProfile(docSnap.data() as UserProfile);
         } else {
-          // Create new record
-          const initialProfile: UserProfile = {
-            email: user.email || '',
-            name: user.displayName || 'Rise Companion',
-            photoURL: user.photoURL || '',
-            createdAt: new Date().toISOString(),
-            preferences: {
-              tone: 'casual',
-              notificationEmail: user.email || '',
-            }
-          };
           await setDoc(userRef, initialProfile);
           setUserProfile(initialProfile);
         }
       } catch (err) {
-        const initialProfile: UserProfile = {
-          email: user.email || '',
-          name: user.displayName || 'Rise Companion',
-          photoURL: user.photoURL || '',
-          createdAt: new Date().toISOString(),
-          preferences: {
-            tone: 'casual',
-            notificationEmail: user.email || '',
-          }
-        };
         setUserProfile(initialProfile);
         handleFirestoreError(err, OperationType.GET, `users/${user.uid}`);
       }
@@ -541,40 +465,30 @@ export default function App() {
     // 2. Fetch or create Behavior Profile
     const fetchBehaviorProfile = async () => {
       const bRef = doc(db, `users/${user.uid}/behaviorProfile`, 'profile');
+      const initialB: BehaviorProfile = {
+        summary: 'Rise companion has launched. Begin your day to extract scheduling patterns.',
+        strengths: ['Early morning analytical sprint'],
+        weaknesses: ['Late afternoon admin friction'],
+        peakProductivityHours: [9, 10, 14],
+        averageTaskDuration: 25,
+        completionRate: 85,
+        lastUpdated: new Date().toISOString(),
+      };
       try {
         const bSnap = await getDoc(bRef);
         if (bSnap.exists()) {
           setBehaviorProfile(bSnap.data() as BehaviorProfile);
         } else {
-          const initialB: BehaviorProfile = {
-            summary: 'Rise companion has launched. Begin your day to extract scheduling patterns.',
-            strengths: ['Early morning analytical sprint'],
-            weaknesses: ['Late afternoon admin friction'],
-            peakProductivityHours: [9, 10, 14],
-            averageTaskDuration: 25,
-            completionRate: 85,
-            lastUpdated: new Date().toISOString(),
-          };
           await setDoc(bRef, initialB);
           setBehaviorProfile(initialB);
         }
       } catch (err) {
-        const initialB: BehaviorProfile = {
-          summary: 'Rise companion has launched. Begin your day to extract scheduling patterns.',
-          strengths: ['Early morning analytical sprint'],
-          weaknesses: ['Late afternoon admin friction'],
-          peakProductivityHours: [9, 10, 14],
-          averageTaskDuration: 25,
-          completionRate: 85,
-          lastUpdated: new Date().toISOString(),
-        };
         setBehaviorProfile(initialB);
         handleFirestoreError(err, OperationType.GET, `users/${user.uid}/behaviorProfile/profile`);
       }
     };
 
-    fetchProfile();
-    fetchBehaviorProfile();
+    Promise.all([fetchProfile(), fetchBehaviorProfile()]);
 
     // 3. Realtime Listener on Tasks Subcollection
     const tasksRef = collection(db, `users/${user.uid}/tasks`);
@@ -624,34 +538,7 @@ export default function App() {
         };
       });
 
-      const defaults = [
-        {
-          id: 'notif-1',
-          type: 'ai' as const,
-          title: 'Adaptive Strategy Ready',
-          message: 'Rise analyzed your coding patterns and recommends starting your coding focus block 15 mins earlier today.',
-          timestamp: '10m ago',
-          read: false,
-        },
-        {
-          id: 'notif-2',
-          type: 'success' as const,
-          title: 'Daily Streak Achieved!',
-          message: 'Congratulations! You have hit a 4-day focus streak. Keep up the momentum!',
-          timestamp: '2h ago',
-          read: false,
-        },
-        {
-          id: 'notif-3',
-          type: 'high' as const,
-          title: 'High Priority Task Due',
-          message: '"Product Strategy Review" is scheduled soon. Make sure to review the calibration details.',
-          timestamp: '4h ago',
-          read: true,
-        },
-      ];
-
-      setNotifications([...loadedNotifs, ...defaults]);
+      setNotifications([...loadedNotifs, ...DEFAULT_NOTIFICATIONS]);
     }, (err) => {
       console.warn('Failed to listen to notifications subcollection:', err);
     });
@@ -895,21 +782,10 @@ export default function App() {
   const triggerAutonomousAgent = async (lastActionDescription: string, type?: string, priority?: string) => {
     if (!user) return;
 
-    let shouldRun = false;
-
-    if (type === 'optimize') {
-      shouldRun = true;
-    } else if (type === 'deadline') {
-      shouldRun = true;
-    } else if (type === 'skipped' && priority === 'high') {
-      shouldRun = true;
-    } else if (type === 'completed') {
-      sessionCompletedCountRef.current += 1;
-      if (sessionCompletedCountRef.current >= 3) {
-        shouldRun = true;
-        sessionCompletedCountRef.current = 0; // Reset
-      }
-    }
+    if (type === 'completed') sessionCompletedCountRef.current++;
+    const shouldRun = type === 'optimize' || type === 'deadline'
+      || (type === 'skipped' && priority === 'high')
+      || (type === 'completed' && sessionCompletedCountRef.current >= 3 && !(sessionCompletedCountRef.current = 0));
 
     if (!shouldRun) {
       console.log(`[Autonomous Agent Guard] Skipped running agent for action: "${lastActionDescription}". Condition not met.`);
@@ -931,17 +807,11 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        if (data.shouldReschedule) {
-          setAutonomousLog({
-            action: `Autonomous AI Rescheduled today's calendar based on: "${data.explanation}"`,
-            time: new Date().toLocaleTimeString(),
-          });
-        } else {
-          setAutonomousLog({
-            action: `Neural agent verified tasks state: ${data.explanation}`,
-            time: new Date().toLocaleTimeString(),
-          });
-        }
+        const logEntry = data.shouldReschedule
+          ? { action: `Autonomous AI Rescheduled today's calendar based on: "${data.explanation}"`, time: new Date().toLocaleTimeString() }
+          : { action: `Neural agent verified tasks state: ${data.explanation}`, time: new Date().toLocaleTimeString() };
+        setAutonomousLog(logEntry);
+        setTimeout(() => setAutonomousLog(null), 8000);
       }
     } catch (err) {
       console.error('Error triggering autonomous background agent:', err);
@@ -1267,29 +1137,6 @@ export default function App() {
               </AnimatePresence>
             </div>
 
-            {/* AI Engine Active/Resting Badge next to avatar on the right */}
-            {aiStatus.isRateLimited ? (
-              <div 
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-[10px] font-semibold text-amber-500 font-mono cursor-help"
-                title={`AI features will refresh in ${aiStatus.minutesRemaining} minutes`}
-              >
-                <span className="relative flex h-1.5 w-1.5">
-                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-amber-500"></span>
-                </span>
-                <span>AI Resting</span>
-              </div>
-            ) : (
-              <div 
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-accent-green-light/20 border border-accent-green/20 text-[10px] font-semibold text-accent-green font-mono cursor-help"
-                title="Rise AI is actively learning"
-              >
-                <span className="relative flex h-1.5 w-1.5">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent-green opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-accent-green"></span>
-                </span>
-                <span>AI Active</span>
-              </div>
-            )}
           </div>
         </header>
 

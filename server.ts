@@ -42,12 +42,234 @@ let rateLimitResetTime = 0;
 
 function setIsRateLimited(limited: boolean) {
   isRateLimited = limited;
-  if (limited) {
-    // Standard resting duration is 10 minutes
-    rateLimitResetTime = Date.now() + 10 * 60 * 1000;
-  } else {
-    rateLimitResetTime = 0;
+  rateLimitResetTime = limited ? Date.now() + 600_000 : 0;
+}
+
+// Stamp every rate-limit fallback response so test runners can detect it
+function rateLimitedJson(res: any, data: object) {
+  return res.json({ ...data, _rateLimitFallback: true });
+}
+
+const isRateLimitError = (e: any) => e?.status === 429 ||
+  (e?.message && (e.message.includes('429') ||
+    e.message.toLowerCase().includes('quota') ||
+    e.message.toLowerCase().includes('rate limit')));
+
+async function sendGmail(accessToken: string, to: string, subject: string, body: string) {
+  const raw = Buffer.from([
+    `To: ${to}`, `Subject: ${subject}`,
+    'Content-Type: text/plain; charset=utf-8', 'MIME-Version: 1.0', '', body,
+  ].join('\r\n')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ raw }),
+  });
+  if (!res.ok) throw new Error(`Gmail API error: ${await res.text()}`);
+}
+
+function parseGeminiText(text: string | null | undefined): any {
+  if (!text) throw new Error('Empty response from Gemini');
+  return JSON.parse(text);
+}
+
+async function deleteCollection(userId: string, name: string) {
+  const snap = await getDocs(collection(db, 'users', userId, name));
+  await Promise.all(snap.docs.map(d => deleteDoc(d.ref)));
+}
+
+// ── TEST MODE ─────────────────────────────────────────────────────────────────
+// When TEST_MODE=true the server generates context-aware mock responses instead
+// of calling Gemini. Zero quota consumed. Switch on with: TEST_MODE=true tsx server.ts
+const TEST_MODE = process.env.TEST_MODE === 'true';
+
+function mockGenerateContent(prompt: string): string {
+  const p = prompt.toLowerCase();
+
+  // ── /api/tasks/analyze ───────────────────────────────────────────────────
+  if (p.includes('category preferred') || p.includes('difficulty level')) {
+    // Extract ONLY the task title field (not full prompt which contains category names in instructions)
+    const titleRaw = (prompt.match(/- Title: "([^"]+)"/) ?? [])[1] ?? '';
+    const t = titleRaw.toLowerCase();
+
+    let category = 'other';
+    const codingKw = ['code', 'implement', 'build', 'deploy', 'debug', 'fix', 'api', 'middleware',
+      'authentication', 'fastapi', 'typescript', 'dashboard', 'database', 'backend', 'frontend',
+      'endpoint', 'server', 'docker', 'test', 'function', 'class', 'module', 'script'];
+    const writingKw = ['write', 'blog', 'report', 'documentation', 'doc', 'essay', 'post',
+      'readme', 'content', 'presentation', 'article', 'draft', 'memo'];
+    const meetingKw = ['call', 'meeting', 'standup', 'sync', 'interview', 'team', 'review'];
+    const learningKw = ['learn', 'study', 'course', 'read', 'tutorial', 'research'];
+    const adminKw = ['admin', 'invoice', 'expense', 'tax', 'submit', 'file', 'budget'];
+
+    if (codingKw.some(k => t.includes(k))) category = 'coding';
+    else if (writingKw.some(k => t.includes(k))) category = 'writing';
+    else if (meetingKw.some(k => t.includes(k))) category = 'meeting';
+    else if (learningKw.some(k => t.includes(k))) category = 'learning';
+    else if (adminKw.some(k => t.includes(k))) category = 'admin';
+
+    // Respect explicit category override
+    const overrideVal = (prompt.match(/- Category Preferred: "([^"]+)"/) ?? [])[1];
+    if (overrideVal && overrideVal !== 'auto') category = overrideVal;
+
+    // Extract difficulty from the actual field (not keyword scan of full prompt)
+    const diffVal = ((prompt.match(/- Difficulty Level: "([^"]+)"/) ?? [])[1] ?? 'medium').toLowerCase();
+    let estimatedMinutes = diffVal === 'hard' ? 90 : diffVal === 'easy' ? 15 : 30;
+
+    // Extract behavior profile numbers from the actual prompt lines
+    const completionRate = parseInt((prompt.match(/- Completion rate: (\d+)%/) ?? [])[1] ?? '70');
+    const avgDuration = parseInt((prompt.match(/- Average task duration: (\d+) mins/) ?? [])[1] ?? '30');
+    if (completionRate >= 85 && avgDuration <= 25)
+      estimatedMinutes = Math.max(10, Math.round(estimatedMinutes * 0.6));
+    else if (completionRate <= 65 && avgDuration >= 50)
+      estimatedMinutes = Math.round(estimatedMinutes * 1.5);
+
+    // Extract deadline from the actual field
+    const deadlineVal = (prompt.match(/- Deadline: "([^"]+)"/) ?? [])[1] ?? 'not specified';
+    const priority = (deadlineVal && deadlineVal !== 'not specified') ? 'high' : 'medium';
+
+    return JSON.stringify({ category, estimatedMinutes, priority });
   }
+
+  // ── /api/voice-command ───────────────────────────────────────────────────
+  if (p.includes('process this voice command') || p.includes('voice assistant')) {
+    const transcriptMatch = prompt.match(/Process this voice command transcript: "([^"]+)"/i);
+    const transcript = (transcriptMatch?.[1] ?? '').toLowerCase();
+
+    if (transcript.includes('optimize') || transcript.includes('schedule my day'))
+      return JSON.stringify({ action: 'optimize', confidence: 'high', message: 'Optimizing your day.' });
+    if (transcript.includes('next task') || transcript.includes('whats my next') || transcript.includes("what's my next"))
+      return JSON.stringify({ action: 'get_next', confidence: 'high', message: 'Here is your next task.' });
+
+    // Parse pendingTasks from prompt (sent as JSON array)
+    const pendingSection = prompt.match(/Existing pending tasks[^:]*:\s*(\[[\s\S]*?\])\s*(?:\n\s*\n|$)/i)?.[1];
+    let pendingTasks: Array<{id: string; title: string; category?: string}> = [];
+    try { if (pendingSection) pendingTasks = JSON.parse(pendingSection); } catch {}
+
+    // Mark as done: "mark X as done"
+    if (transcript.includes('mark') && (transcript.includes('done') || transcript.includes('complete'))) {
+      const stopWords = new Set(['mark', 'done', 'the', 'as', 'it', 'that', 'this', 'a', 'an', 'task', 'complete', 'my']);
+      const keywords = transcript.split(/\s+/).filter((w: string) => w.length > 3 && !stopWords.has(w));
+      const match = pendingTasks.find((t: any) => keywords.some((k: string) => t.title.toLowerCase().includes(k)));
+      return JSON.stringify({ action: 'complete_specific', taskId: match?.id ?? pendingTasks[0]?.id ?? '1', confidence: 'high', message: 'Task marked done.' });
+    }
+
+    // Finish/complete specific task: may need clarification
+    if ((transcript.includes('finish') || transcript.includes('complete the')) && pendingTasks.length > 0) {
+      const stopWords = new Set(['mark', 'done', 'the', 'as', 'it', 'that', 'this', 'a', 'an', 'task', 'complete', 'finish', 'my', 'and', 'for']);
+      const keywords = transcript.split(/\s+/).filter((w: string) => w.length > 3 && !stopWords.has(w));
+      const catMatches = pendingTasks.filter((t: any) => keywords.some((k: string) => (t.category ?? '').includes(k)));
+      const titleMatches = pendingTasks.filter((t: any) => keywords.some((k: string) => t.title.toLowerCase().includes(k)));
+      const matches = catMatches.length ? catMatches : titleMatches;
+      if (matches.length === 1)
+        return JSON.stringify({ action: 'complete_specific', taskId: matches[0].id, confidence: 'high', message: 'Task done.' });
+      if (matches.length >= 2)
+        return JSON.stringify({ action: 'complete_specific', needsClarification: true, clarificationOptions: matches.map((t: any) => t.title), confidence: 'medium', message: 'Which task did you mean?' });
+    }
+
+    // Default: add_task — clean up transcript
+    let taskTitle = transcript;
+
+    // Strip leading fillers iteratively
+    const leadingFiller = /^(mm+|um+|uh+|er+|hmm+|yeah|so|ok|hey|like)\s+/i;
+    for (let i = 0; i < 10 && leadingFiller.test(taskTitle); i++)
+      taskTitle = taskTitle.replace(leadingFiller, '');
+
+    // Strip command prefix
+    const cmdPrefixes = ['add a task to ', 'add task to ', 'add a task ', 'add task ',
+      'remind me to ', 'i need to ', 'i have to ', 'please create ', 'please add ',
+      'create task ', 'new task ', 'make a task to ', 'make task '];
+    for (const pfx of cmdPrefixes) {
+      if (taskTitle.startsWith(pfx)) { taskTitle = taskTitle.slice(pfx.length); break; }
+    }
+
+    // Strip leading fillers again after prefix removal
+    for (let i = 0; i < 5 && leadingFiller.test(taskTitle); i++)
+      taskTitle = taskTitle.replace(leadingFiller, '');
+
+    // Strip inline fillers
+    taskTitle = taskTitle.replace(/\b(um+|uh+|er+|like|you know|kind of|kinda|sort of|i mean|basically|actually|literally|pls|please)\b\s*/gi, '');
+
+    // Fix homophones
+    taskTitle = taskTitle
+      .replace(/\bwright\b/gi, 'write')
+      .replace(/\brevue\b/gi, 'review')
+      .replace(/\bbag\b/gi, 'bug');
+
+    // Capitalize proper nouns after action verbs
+    taskTitle = taskTitle.replace(/\b(call|email|meet|contact)\s+([a-z])/gi, (_, v, c) => `${v} ${c.toUpperCase()}`);
+
+    taskTitle = taskTitle.replace(/\s+/g, ' ').trim();
+    if (taskTitle) taskTitle = taskTitle.charAt(0).toUpperCase() + taskTitle.slice(1);
+
+    const hasCommandPrefix = /\b(add|create|remind|make|new)\b/.test(transcript);
+    const wordCount = taskTitle.split(/\s+/).filter((w: string) => w.length > 0).length;
+    const confidence = hasCommandPrefix ? 'high' : wordCount >= 3 ? 'medium' : 'low';
+
+    return JSON.stringify({ action: 'add_task', taskTitle, category: 'other',
+      estimatedMinutes: 30, priority: 'medium', difficulty: 'medium', confidence,
+      message: `Task added: ${taskTitle}` });
+  }
+
+  // ── /api/tasks/breakdown ─────────────────────────────────────────────────
+  if (p.includes('break down') || p.includes('subtask') || p.includes('breakdown specialist')) {
+    const titleMatch = prompt.match(/Title:\s*["']([^"']+)["']/i);
+    const title = titleMatch?.[1] ?? 'Task';
+    return JSON.stringify({
+      subtasks: [
+        { title: `Plan and outline approach for: ${title}`, estimatedMinutes: 15, order: 1, reasoning: 'Clarity first' },
+        { title: `Set up environment and dependencies`, estimatedMinutes: 20, order: 2, reasoning: 'Foundation' },
+        { title: `Implement core logic`, estimatedMinutes: 30, order: 3, reasoning: 'Main work' },
+        { title: `Write tests and review`, estimatedMinutes: 20, order: 4, reasoning: 'Quality gate' },
+        { title: `Document and finalize`, estimatedMinutes: 15, order: 5, reasoning: 'Completeness' },
+      ],
+      executionStrategy: 'Sequential approach: plan → build → test → document.',
+    });
+  }
+
+  // ── /api/tasks/analyze-context ───────────────────────────────────────────
+  if (p.includes('pattern detector') || p.includes('new task:')) {
+    // Extract new task title from actual prompt format: New task: "${title}" - ...
+    const newTask = ((prompt.match(/New task: "([^"]+)"/) ?? [])[1] ?? '').toLowerCase();
+    const issues: any[] = [];
+
+    // Parse existing tasks from prompt lines: - "Title" (status: X, ...)
+    const existingEntries = [...prompt.matchAll(/- "([^"]+)" \(status: (\w+)/gi)]
+      .map(m => ({ title: m[1].toLowerCase(), status: m[2].toLowerCase(), raw: m[1] }));
+
+    // Duplicate detection: word overlap or near-identical after stripping articles
+    const normalize = (s: string) => s.replace(/\b(the|a|an)\b/gi, '').replace(/\s+/g, ' ').trim();
+    const newNorm = normalize(newTask);
+    const newWords = new Set(newTask.split(' ').filter((w: string) => w.length > 3));
+
+    for (const entry of existingEntries) {
+      const existWords = new Set(entry.title.split(' ').filter((w: string) => w.length > 3));
+      const overlap = [...newWords].filter(w => existWords.has(w)).length;
+      const isDuplicate = overlap >= 2
+        || (overlap >= 1 && Math.abs(newTask.length - entry.title.length) < 10)
+        || normalize(entry.title) === newNorm;
+      if (isDuplicate) {
+        issues.push({ type: 'duplicate', severity: 'warning',
+          message: `Similar task already exists: "${entry.raw}"`,
+          suggestion: 'Consider continuing the existing task.',
+          relatedTaskIds: ['1'] });
+        break;
+      }
+    }
+
+    // Abandonment detection: count tasks with abandoned status
+    const abandonedCount = existingEntries.filter(e => e.status === 'abandoned').length;
+    if (abandonedCount >= 2) {
+      issues.push({ type: 'recurring_abandonment', severity: 'warning',
+        message: `You have abandoned similar tasks ${abandonedCount} times before.`,
+        suggestion: 'Try breaking it into smaller steps.',
+        relatedTaskIds: ['1', '2', '3'].slice(0, abandonedCount) });
+    }
+
+    return JSON.stringify({ issues, shouldProceed: true });
+  }
+
+  return JSON.stringify({ message: 'Mock response' });
 }
 
 // Cache helper
@@ -62,13 +284,12 @@ async function getCachedOrGenerate(
     return await generateFn();
   }
 
+  const cacheRef = doc(db, 'users', userId, 'cache', cacheKey);
   try {
-    const cacheRef = doc(db, 'users', userId, 'cache', cacheKey);
     const cachedSnap = await getDoc(cacheRef);
     if (cachedSnap.exists()) {
       const data = cachedSnap.data();
-      const expiresAt = data.expiresAt;
-      const expiresAtMillis = expiresAt?.toMillis ? expiresAt.toMillis() : (typeof expiresAt === 'number' ? expiresAt : null);
+      const expiresAtMillis = data.expiresAt?.toMillis?.() ?? null;
       if (expiresAtMillis && expiresAtMillis > Date.now()) {
         console.log(`[Cache Hit] Key: ${cacheKey} for user ${userId}`);
         return data.value;
@@ -82,7 +303,6 @@ async function getCachedOrGenerate(
   const newValue = await generateFn();
 
   try {
-    const cacheRef = doc(db, 'users', userId, 'cache', cacheKey);
     await setDoc(cacheRef, {
       value: newValue,
       generatedAt: Timestamp.now(),
@@ -111,48 +331,19 @@ app.post('/api/admin/clear-user-data', async (req, res) => {
 
     console.log(`[Factory Reset] Cleaning up database for user: ${userId}`);
 
-    // 1. Delete all tasks and their subtasks
-    const tasksRef = collection(db, 'users', userId, 'tasks');
-    const tasksSnap = await getDocs(tasksRef);
-    for (const taskDoc of tasksSnap.docs) {
-      // Delete subtasks if any
-      const subtasksRef = collection(db, 'users', userId, 'tasks', taskDoc.id, 'subtasks');
-      const subtasksSnap = await getDocs(subtasksRef);
-      for (const subDoc of subtasksSnap.docs) {
-        await deleteDoc(doc(db, 'users', userId, 'tasks', taskDoc.id, 'subtasks', subDoc.id));
-      }
-      // Delete the parent task doc
-      await deleteDoc(doc(db, 'users', userId, 'tasks', taskDoc.id));
-    }
-
-    // 2. Delete all daily behavior logs
-    const behaviorRef = collection(db, 'users', userId, 'behavior');
-    const behaviorSnap = await getDocs(behaviorRef);
-    for (const bDoc of behaviorSnap.docs) {
-      await deleteDoc(doc(db, 'users', userId, 'behavior', bDoc.id));
-    }
-
-    // 3. Delete behavior profile doc
-    const profileRef = doc(db, 'users', userId, 'behaviorProfile', 'profile');
-    await deleteDoc(profileRef);
-
-    // 4. Delete notifications
-    const notificationsRef = collection(db, 'users', userId, 'notifications');
-    const notificationsSnap = await getDocs(notificationsRef);
-    for (const nDoc of notificationsSnap.docs) {
-      await deleteDoc(doc(db, 'users', userId, 'notifications', nDoc.id));
-    }
-
-    // 5. Delete cache
-    const cacheRef = collection(db, 'users', userId, 'cache');
-    const cacheSnap = await getDocs(cacheRef);
-    for (const cDoc of cacheSnap.docs) {
-      await deleteDoc(doc(db, 'users', userId, 'cache', cDoc.id));
-    }
-
-    // 6. Delete locks
-    const lockRef = doc(db, 'users', userId, 'locks', 'autonomous_agent');
-    await deleteDoc(lockRef);
+    const tasksSnap = await getDocs(collection(db, 'users', userId, 'tasks'));
+    await Promise.all([
+      ...tasksSnap.docs.map(async taskDoc => {
+        const subtasksSnap = await getDocs(collection(db, 'users', userId, 'tasks', taskDoc.id, 'subtasks'));
+        await Promise.all(subtasksSnap.docs.map(d => deleteDoc(d.ref)));
+        await deleteDoc(taskDoc.ref);
+      }),
+      deleteCollection(userId, 'behavior'),
+      deleteDoc(doc(db, 'users', userId, 'behaviorProfile', 'profile')),
+      deleteCollection(userId, 'notifications'),
+      deleteCollection(userId, 'cache'),
+      deleteDoc(doc(db, 'users', userId, 'locks', 'autonomous_agent')),
+    ]);
 
     console.log(`[Factory Reset] Successfully deleted all data for user ${userId}`);
     res.json({ success: true, message: "All user data deleted successfully." });
@@ -164,10 +355,7 @@ app.post('/api/admin/clear-user-data', async (req, res) => {
 
 // API endpoint: Get AI Status
 app.get('/api/ai-status', (req, res) => {
-  if (isRateLimited && Date.now() > rateLimitResetTime) {
-    isRateLimited = false;
-    rateLimitResetTime = 0;
-  }
+  if (isRateLimited && Date.now() > rateLimitResetTime) setIsRateLimited(false);
   res.json({
     isRateLimited,
     isResting: isRateLimited,
@@ -218,28 +406,20 @@ app.post('/api/generate-insights', async (req, res) => {
         }
       });
 
-      if (!response.text) {
-        throw new Error('Empty response from Gemini');
-      }
-      return JSON.parse(response.text);
+      return parseGeminiText(response.text);
     };
 
     const data = await getCachedOrGenerate(userId, cacheKey, generateFn, ttlMs);
     res.json(data);
   } catch (error: any) {
-    const isRateLimit = error.status === 429 || 
-                        (error.message && error.message.includes('429')) ||
-                        (error.message && error.message.toLowerCase().includes('quota')) ||
-                        (error.message && error.message.toLowerCase().includes('rate limit'));
-    
-    if (isRateLimit) {
+    if (isRateLimitError(error)) {
       console.warn('Gemini rate limit hit for generate-insights. Using fallback response.');
       setIsRateLimited(true);
       const { type } = req.body;
       if (type === 'progress') {
-        return res.json({ insight: "You are on track today. Keep going." });
+        return rateLimitedJson(res, { insight: "You are on track today. Keep going." });
       } else {
-        return res.json({ insight: "Building your unique work pattern profile..." });
+        return rateLimitedJson(res, { insight: "Building your unique work pattern profile..." });
       }
     }
     console.error('Insights generation error:', error);
@@ -276,38 +456,32 @@ app.post('/api/tasks/analyze', async (req, res) => {
       3. Assign an optimal Priority ("low", "medium", "high"). Elevate priority if there is an upcoming deadline or high difficulty.
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            category: { type: 'STRING', enum: ['coding', 'writing', 'admin', 'meeting', 'learning', 'other'] },
-            estimatedMinutes: { type: 'INTEGER' },
-            priority: { type: 'STRING', enum: ['low', 'medium', 'high'] }
-          },
-          required: ['category', 'estimatedMinutes', 'priority']
-        }
-      }
-    });
+    const responseText = TEST_MODE
+      ? mockGenerateContent(prompt)
+      : (await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'OBJECT',
+              properties: {
+                category: { type: 'STRING', enum: ['coding', 'writing', 'admin', 'meeting', 'learning', 'personal', 'other'] },
+                estimatedMinutes: { type: 'INTEGER' },
+                priority: { type: 'STRING', enum: ['low', 'medium', 'high'] }
+              },
+              required: ['category', 'estimatedMinutes', 'priority']
+            }
+          }
+        })).text;
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(responseText);
     res.json(data);
   } catch (error: any) {
-    const isRateLimit = error.status === 429 || 
-                        (error.message && error.message.includes('429')) ||
-                        (error.message && error.message.toLowerCase().includes('quota')) ||
-                        (error.message && error.message.toLowerCase().includes('rate limit'));
-
-    if (isRateLimit) {
+    if (isRateLimitError(error)) {
       console.warn('Gemini rate limit hit for task analysis. Using fallback response.');
       setIsRateLimited(true);
-      return res.json({
+      return rateLimitedJson(res, {
         category: 'other',
         estimatedMinutes: 30,
         priority: 'medium'
@@ -385,10 +559,7 @@ app.post('/api/optimize', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
 
     // Backward compatibility: Map task items to optimizedTasks array
     const optimizedTasks = data.schedule
@@ -416,18 +587,11 @@ app.post('/api/optimize', async (req, res) => {
 
     // Auto-update Firestore tasks schedules
     if (userId) {
-      for (const item of optimizedTasks) {
-        if (item.taskId) {
-          try {
-            await setDoc(doc(db, 'users', userId, 'tasks', item.taskId), {
-              scheduledAt: item.startTime,
-              estimatedMinutes: item.durationMinutes
-            }, { merge: true });
-          } catch (err) {
-            console.error(`Failed to update task ${item.taskId} schedule:`, err);
-          }
-        }
-      }
+      await Promise.all(optimizedTasks.filter(i => i.taskId).map(item =>
+        setDoc(doc(db, 'users', userId, 'tasks', item.taskId), {
+          scheduledAt: item.startTime, estimatedMinutes: item.durationMinutes
+        }, { merge: true }).catch(err => console.error(`Failed to update task ${item.taskId} schedule:`, err))
+      ));
     }
 
     // Call calendar sync internally if accessToken is available
@@ -454,12 +618,7 @@ app.post('/api/optimize', async (req, res) => {
 
     res.json(finalResponse);
   } catch (error: any) {
-    const isRateLimit = error.status === 429 || 
-                        (error.message && error.message.includes('429')) ||
-                        (error.message && error.message.toLowerCase().includes('quota')) ||
-                        (error.message && error.message.toLowerCase().includes('rate limit'));
-
-    if (isRateLimit) {
+    if (isRateLimitError(error)) {
       console.warn('Gemini rate limit hit for schedule optimize. Using fallback response.');
       setIsRateLimited(true);
       const { tasks } = req.body;
@@ -481,7 +640,7 @@ app.post('/api/optimize', async (req, res) => {
         energyLevel: 'medium',
         reasoning: 'Fallback standard schedule due to Gemini rest mode.'
       }));
-      return res.json({
+      return rateLimitedJson(res, {
         reasoning: "AI is resting. Scheduled tasks based on creation order to preserve continuous flow.",
         energyStrategy: "Direct pacing with standard durations.",
         totalFocusTime: "120",
@@ -565,37 +724,12 @@ app.post('/api/autonomous-agent', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
 
     // If notification required and recipientEmail + accessToken are available, send the email!
     if (recipientEmail && accessToken) {
       try {
-        const rawMessage = [
-          `To: ${recipientEmail}`,
-          `Subject: ${data.notificationSubject}`,
-          'Content-Type: text/plain; charset=utf-8',
-          'MIME-Version: 1.0',
-          '',
-          data.notificationMessage
-        ].join('\r\n');
-
-        const encodedMessage = Buffer.from(rawMessage)
-          .toString('base64')
-          .replace(/\+/g, '-')
-          .replace(/\//g, '_')
-          .replace(/=+$/, '');
-
-        await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ raw: encodedMessage })
-        });
+        await sendGmail(accessToken, recipientEmail, data.notificationSubject, data.notificationMessage);
         console.log(`Autonomous Notification email successfully sent to ${recipientEmail}`);
       } catch (err) {
         console.error('Error sending autonomous email notification:', err);
@@ -604,15 +738,10 @@ app.post('/api/autonomous-agent', async (req, res) => {
 
     res.json(data);
   } catch (error: any) {
-    const isRateLimit = error.status === 429 || 
-                        (error.message && error.message.includes('429')) ||
-                        (error.message && error.message.toLowerCase().includes('quota')) ||
-                        (error.message && error.message.toLowerCase().includes('rate limit'));
-
-    if (isRateLimit) {
+    if (isRateLimitError(error)) {
       console.warn('Gemini rate limit hit for autonomous-agent. Using fallback response.');
       setIsRateLimited(true);
-      return res.json({
+      return rateLimitedJson(res, {
         shouldReschedule: false,
         explanation: "AI is resting. Keeping your current scheduled order.",
         notificationSubject: "Rise Companion Update",
@@ -657,52 +786,16 @@ app.post('/api/smart-notify', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
 
     // Send email using Gmail API
-    const rawMessage = [
-      `To: ${recipientEmail}`,
-      `Subject: ${data.subject}`,
-      'Content-Type: text/plain; charset=utf-8',
-      'MIME-Version: 1.0',
-      '',
-      data.body
-    ].join('\r\n');
-
-    const encodedMessage = Buffer.from(rawMessage)
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-
-    const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ raw: encodedMessage })
-    });
-
-    if (!gmailRes.ok) {
-      const errTxt = await gmailRes.text();
-      throw new Error(`Gmail API response error: ${errTxt}`);
-    }
-
+    await sendGmail(accessToken, recipientEmail, data.subject, data.body);
     res.json({ success: true, email: data });
   } catch (error: any) {
-    const isRateLimit = error.status === 429 || 
-                        (error.message && error.message.includes('429')) ||
-                        (error.message && error.message.toLowerCase().includes('quota')) ||
-                        (error.message && error.message.toLowerCase().includes('rate limit'));
-
-    if (isRateLimit) {
+    if (isRateLimitError(error)) {
       console.warn('Gemini rate limit hit for smart notify. Using fallback response.');
       setIsRateLimited(true);
-      return res.json({
+      return rateLimitedJson(res, {
         success: true,
         email: {
           subject: `Reminder: ${req.body.taskTitle}`,
@@ -718,52 +811,73 @@ app.post('/api/smart-notify', async (req, res) => {
 // API: Process Voice Command (Actually does things now!)
 app.post('/api/voice-command', async (req, res) => {
   try {
-    const { transcript, userId, accessToken, behaviorProfile } = req.body;
+    const { transcript, userId, accessToken, behaviorProfile, pendingTasks } = req.body;
+
+    const pendingTasksContext = pendingTasks && pendingTasks.length > 0
+      ? `\nExisting pending tasks (for matching completion commands):\n${JSON.stringify(pendingTasks, null, 2)}`
+      : '';
 
     const prompt = `
-      You are Rise, an AI-powered voice assistant. 
-      Process the following voice command transcript from the user: "${transcript}"
+      You are Rise, an AI-powered voice assistant for productivity.
+      Process this voice command transcript: "${transcript}"
+      ${pendingTasksContext}
 
-      Analyze the command and classify the action into one of the following:
-      1. "add_task" - if user wants to create a new task. Extract taskTitle, category (coding, writing, admin, meeting, learning, other), estimatedMinutes, priority (low, medium, high), difficulty (easy, medium, hard).
-         CRITICAL: taskTitle MUST ALWAYS be a cleaned title without voice command words (like "add a task to", "remind me to", "please create", etc.). For example, if transcript is "Add a task to finish the documentation by tomorrow", taskTitle MUST be "Finish the documentation" or "Finish documentation".
-      2. "optimize" - if user wants to schedule or optimize their day.
-      3. "get_next" - if user wants to view/know their next task.
-      4. "complete_current" - if user wants to finish the active/current task.
-      5. "complete_specific" - if user wants to complete a specific task by its name or keyword. Extract targetTaskKeyword.
-      6. "unknown" - if command is not recognized.
+      STEP 1 — CLEAN THE TRANSCRIPT:
+      - Fix common homophones based on task context: wright→write, revue→review, bag→bug (tech), right→write (writing context), sea→see, etc.
+      - Strip ALL filler words: um, uh, er, hmm, like, you know, so, yeah, kind of, kinda, sort of, i mean, basically, actually, literally, ok so, anyway.
+      - Strip command prefixes: "add a task to", "remind me to", "please create", "i need to", "i have to", "create task", "new task", "add task to", "make a task to".
+      - Capitalize proper nouns (names, places): "call john" → "Call John", "email sarah" → "Email Sarah".
+      - The resulting taskTitle should be clean, concise, properly capitalized, and action-focused.
 
-      Provide a short, pleasant feedback message explaining what action is being executed.
+      STEP 2 — CLASSIFY THE ACTION:
+      1. "add_task" — user wants to create a new task. Extract: taskTitle (cleaned), category, estimatedMinutes, priority, difficulty.
+      2. "optimize" — user wants to schedule/optimize their day.
+      3. "get_next" — user wants to see/know their next task.
+      4. "complete_current" — user wants to complete the active/current task.
+      5. "complete_specific" — user wants to complete a task by name. Match against pendingTasks list.
+         - If EXACTLY ONE task matches: set taskId to that task's id, confidence to "high".
+         - If MULTIPLE tasks match and it's ambiguous: set needsClarification=true, clarificationOptions=[matching task titles], action="complete_specific".
+      6. "unknown" — command not recognized.
+
+      STEP 3 — RATE CONFIDENCE:
+      - "high": clear, unambiguous command
+      - "medium": reasonable interpretation but some uncertainty
+      - "low": very unclear, guessing
+
+      Provide a short (max 15 words) feedback message.
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            action: { type: 'STRING', enum: ['add_task', 'optimize', 'get_next', 'complete_current', 'complete_specific', 'unknown'] },
-            taskTitle: { type: 'STRING' },
-            category: { type: 'STRING', enum: ['coding', 'writing', 'admin', 'meeting', 'learning', 'other'] },
-            estimatedMinutes: { type: 'INTEGER' },
-            priority: { type: 'STRING', enum: ['low', 'medium', 'high'] },
-            difficulty: { type: 'STRING', enum: ['easy', 'medium', 'hard'] },
-            targetTaskKeyword: { type: 'STRING' },
-            message: { type: 'STRING' },
-            originalTranscript: { type: 'STRING' },
-            confidence: { type: 'STRING', enum: ['high', 'medium', 'low'] }
-          },
-          required: ['action', 'message']
-        }
-      }
-    });
+    const voiceResponseText = TEST_MODE
+      ? mockGenerateContent(prompt)
+      : (await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', enum: ['add_task', 'optimize', 'get_next', 'complete_current', 'complete_specific', 'unknown'] },
+                taskTitle: { type: 'STRING' },
+                category: { type: 'STRING', enum: ['coding', 'writing', 'admin', 'meeting', 'learning', 'personal', 'other'] },
+                estimatedMinutes: { type: 'INTEGER' },
+                priority: { type: 'STRING', enum: ['low', 'medium', 'high'] },
+                difficulty: { type: 'STRING', enum: ['easy', 'medium', 'hard'] },
+                targetTaskKeyword: { type: 'STRING' },
+                taskId: { type: 'STRING' },
+                needsClarification: { type: 'BOOLEAN' },
+                clarificationOptions: { type: 'ARRAY', items: { type: 'STRING' } },
+                message: { type: 'STRING' },
+                originalTranscript: { type: 'STRING' },
+                confidence: { type: 'STRING', enum: ['high', 'medium', 'low'] }
+              },
+              required: ['action', 'message', 'confidence']
+            }
+          }
+        })).text;
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const result = JSON.parse(response.text);
+    if (!voiceResponseText) throw new Error('Empty response from Gemini');
+    const result = JSON.parse(voiceResponseText);
 
     // ACTUALLY EXECUTE THE ACTIONS IN FIRESTORE
     if (userId) {
@@ -840,18 +954,12 @@ app.post('/api/voice-command', async (req, res) => {
         await setDoc(newTaskRef, newTask);
         result.message = `Task added: "${title}" (${est} mins, ${prio} priority). Scheduled automatically!`;
         
-        // Auto-run pattern analysis
-        try {
-          fetch(`http://localhost:3000/api/tasks/analyze-context`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              newTaskTitle: title,
-              newTaskDescription: newTask.description,
-              userId
-            })
-          }).catch(() => {});
-        } catch (err) {}
+        // Auto-run pattern analysis (fire-and-forget)
+        fetch(`http://localhost:3000/api/tasks/analyze-context`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ newTaskTitle: title, newTaskDescription: newTask.description, userId })
+        }).catch(() => {});
 
       } else if (result.action === 'optimize') {
         const tasksRef = collection(db, 'users', userId, 'tasks');
@@ -901,22 +1009,20 @@ app.post('/api/voice-command', async (req, res) => {
 
           result.message = `Marked task "${taskToComplete.title}" as Done! Emergent pattern detection running in background...`;
 
-          try {
-            fetch(`http://localhost:3000/api/learn-from-completion`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                taskId: taskToComplete.id,
-                category: taskToComplete.category,
-                estimatedMinutes: taskToComplete.estimatedMinutes || 30,
-                actualMinutes: taskToComplete.estimatedMinutes || 30,
-                difficulty: taskToComplete.difficulty || 'medium',
-                timeOfDay: new Date().toLocaleTimeString(),
-                userId,
-                behaviorProfile
-              })
-            }).catch(() => {});
-          } catch (err) {}
+          fetch(`http://localhost:3000/api/learn-from-completion`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              taskId: taskToComplete.id,
+              category: taskToComplete.category,
+              estimatedMinutes: taskToComplete.estimatedMinutes || 30,
+              actualMinutes: taskToComplete.estimatedMinutes || 30,
+              difficulty: taskToComplete.difficulty || 'medium',
+              timeOfDay: new Date().toLocaleTimeString(),
+              userId,
+              behaviorProfile
+            })
+          }).catch(() => {});
         } else {
           result.message = "I couldn't find an active or pending task to complete.";
         }
@@ -925,17 +1031,13 @@ app.post('/api/voice-command', async (req, res) => {
 
     res.json(result);
   } catch (error: any) {
-    const isRateLimit = error.status === 429 || 
-                        (error.message && error.message.includes('429')) ||
-                        (error.message && error.message.toLowerCase().includes('quota')) ||
-                        (error.message && error.message.toLowerCase().includes('rate limit'));
-
-    if (isRateLimit) {
+    if (isRateLimitError(error)) {
       console.warn('Gemini rate limit hit for voice command. Using fallback response.');
       setIsRateLimited(true);
-      return res.json({
+      return rateLimitedJson(res, {
         action: 'unknown',
-        message: "Voice processing is temporarily resting. Please try typing or adding tasks manually."
+        message: "Voice processing is temporarily resting. Please try typing or adding tasks manually.",
+        confidence: 'low'
       });
     }
     console.error('Voice command error:', error);
@@ -971,64 +1073,65 @@ app.post('/api/tasks/breakdown', async (req, res) => {
       5. Total estimated time roughly equals the parent task time
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            subtasks: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  title: { type: 'STRING' },
-                  estimatedMinutes: { type: 'INTEGER' },
-                  order: { type: 'INTEGER' },
-                  reasoning: { type: 'STRING' }
+    const breakdownResponseText = TEST_MODE
+      ? mockGenerateContent(prompt)
+      : (await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'OBJECT',
+              properties: {
+                subtasks: {
+                  type: 'ARRAY',
+                  items: {
+                    type: 'OBJECT',
+                    properties: {
+                      title: { type: 'STRING' },
+                      estimatedMinutes: { type: 'INTEGER' },
+                      order: { type: 'INTEGER' },
+                      reasoning: { type: 'STRING' }
+                    },
+                    required: ['title', 'estimatedMinutes', 'order', 'reasoning']
+                  }
                 },
-                required: ['title', 'estimatedMinutes', 'order', 'reasoning']
-              }
+                executionStrategy: { type: 'STRING' }
+              },
+              required: ['subtasks', 'executionStrategy']
             },
-            executionStrategy: { type: 'STRING' }
-          },
-          required: ['subtasks', 'executionStrategy']
-        },
-        temperature: 0.4
-      }
-    });
+            temperature: 0.4
+          }
+        })).text;
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    if (!breakdownResponseText) throw new Error('Empty response from Gemini');
+    const data = JSON.parse(breakdownResponseText);
 
     // Create subtasks in Firestore
     if (userId && taskId) {
       const subtasks = data.subtasks || [];
-      for (const st of subtasks) {
-        const subtaskId = `subtask_${st.order}`;
-        await setDoc(doc(db, 'users', userId, 'tasks', taskId, 'subtasks', subtaskId), {
-          title: st.title,
-          estimatedMinutes: st.estimatedMinutes,
-          order: st.order,
-          reasoning: st.reasoning,
-          completed: false,
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      // Update parent task with hasSubtasks: true and strategy
-      await setDoc(doc(db, 'users', userId, 'tasks', taskId), {
-        hasSubtasks: true,
-        executionStrategy: data.executionStrategy
-      }, { merge: true });
+      await Promise.all([
+        ...subtasks.map((st: any) => setDoc(
+          doc(db, 'users', userId, 'tasks', taskId, 'subtasks', `subtask_${st.order}`),
+          { title: st.title, estimatedMinutes: st.estimatedMinutes, order: st.order, reasoning: st.reasoning, completed: false, createdAt: new Date().toISOString() }
+        )),
+        setDoc(doc(db, 'users', userId, 'tasks', taskId), { hasSubtasks: true, executionStrategy: data.executionStrategy }, { merge: true }),
+      ]);
     }
 
     res.json(data);
   } catch (error: any) {
+    if (isRateLimitError(error)) {
+      setIsRateLimited(true);
+      return rateLimitedJson(res, {
+        subtasks: [
+          { title: 'Plan and outline approach', estimatedMinutes: 15, order: 1, reasoning: 'Fallback: AI resting' },
+          { title: 'Execute core work', estimatedMinutes: 30, order: 2, reasoning: 'Fallback: AI resting' },
+          { title: 'Review and finalize', estimatedMinutes: 15, order: 3, reasoning: 'Fallback: AI resting' },
+        ],
+        executionStrategy: 'Standard sequential approach (AI offline fallback)'
+      });
+    }
     console.error('Auto breakdown error:', error);
     res.status(500).json({ error: error.message || 'Failed to auto breakdown task' });
   }
@@ -1059,49 +1162,54 @@ app.post('/api/tasks/analyze-context', async (req, res) => {
       ${(tasksToAnalyze || []).map((t: any) => `- "${t.title}" (status: ${t.status}, category: ${t.category}, created: ${t.createdAt})`).join('\n')}
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            issues: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  type: { type: 'STRING', enum: ['duplicate', 'recurring_abandonment', 'dependency', 'unrealistic_timing', 'pattern_warning'] },
-                  severity: { type: 'STRING', enum: ['info', 'warning', 'critical'] },
-                  message: { type: 'STRING' },
-                  suggestion: { type: 'STRING' },
-                  relatedTaskIds: { type: 'ARRAY', items: { type: 'STRING' } }
-                },
-                required: ['type', 'severity', 'message', 'suggestion']
-              }
-            },
-            shouldProceed: { type: 'BOOLEAN' },
-            modifiedTaskSuggestion: {
+    const contextResponseText = TEST_MODE
+      ? mockGenerateContent(prompt)
+      : (await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
               type: 'OBJECT',
               properties: {
-                title: { type: 'STRING' },
-                splitInto: { type: 'ARRAY', items: { type: 'STRING' } }
-              }
-            }
-          },
-          required: ['issues', 'shouldProceed']
-        },
-        temperature: 0.3
-      }
-    });
+                issues: {
+                  type: 'ARRAY',
+                  items: {
+                    type: 'OBJECT',
+                    properties: {
+                      type: { type: 'STRING', enum: ['duplicate', 'recurring_abandonment', 'dependency', 'unrealistic_timing', 'pattern_warning'] },
+                      severity: { type: 'STRING', enum: ['info', 'warning', 'critical'] },
+                      message: { type: 'STRING' },
+                      suggestion: { type: 'STRING' },
+                      relatedTaskIds: { type: 'ARRAY', items: { type: 'STRING' } }
+                    },
+                    required: ['type', 'severity', 'message', 'suggestion']
+                  }
+                },
+                shouldProceed: { type: 'BOOLEAN' },
+                modifiedTaskSuggestion: {
+                  type: 'OBJECT',
+                  properties: {
+                    title: { type: 'STRING' },
+                    splitInto: { type: 'ARRAY', items: { type: 'STRING' } }
+                  }
+                }
+              },
+              required: ['issues', 'shouldProceed']
+            },
+            temperature: 0.3
+          }
+        })).text;
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    if (!contextResponseText) throw new Error('Empty response from Gemini');
+    const data = JSON.parse(contextResponseText);
     res.json(data);
   } catch (error: any) {
+    if (isRateLimitError(error)) {
+      console.warn('Gemini rate limit hit for analyze-context. Returning empty issues (graceful fallback).');
+      setIsRateLimited(true);
+      return rateLimitedJson(res, { issues: [], shouldProceed: true });
+    }
     console.error('Task context analysis error:', error);
     res.status(500).json({ error: error.message || 'Failed to analyze task context' });
   }
@@ -1129,18 +1237,12 @@ app.post('/api/learn-from-completion', async (req, res) => {
       const newAvg = Math.round((prevAvg * 4 + actualMinutes) / 5);
       updatedProfile.averageTaskDuration = newAvg;
 
-      // Handle strengths & weaknesses
-      let currentStrengths = updatedProfile.strengths || [];
-      let currentWeaknesses = updatedProfile.weaknesses || [];
-
-      if (accuracy < 0.7 && !currentStrengths.includes(category)) {
-        currentStrengths.push(category);
-      } else if (accuracy > 1.5 && !currentWeaknesses.includes(category)) {
-        currentWeaknesses.push(category);
-      }
-
-      updatedProfile.strengths = currentStrengths;
-      updatedProfile.weaknesses = currentWeaknesses;
+      const strengths = updatedProfile.strengths || [];
+      const weaknesses = updatedProfile.weaknesses || [];
+      if (accuracy < 0.7 && !strengths.includes(category)) strengths.push(category);
+      else if (accuracy > 1.5 && !weaknesses.includes(category)) weaknesses.push(category);
+      updatedProfile.strengths = strengths;
+      updatedProfile.weaknesses = weaknesses;
       updatedProfile.lastUpdated = new Date().toISOString();
 
       await setDoc(bRef, updatedProfile, { merge: true });
@@ -1205,7 +1307,7 @@ app.post('/api/learn-from-completion', async (req, res) => {
         });
 
         if (response.text) {
-          const learnData = JSON.parse(response.text);
+          const learnData = parseGeminiText(response.text);
           
           // Apply multiplier to Firestore behavior profile
           await setDoc(bRef, {
@@ -1282,10 +1384,7 @@ app.post('/api/focus-mode/activate', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
     res.json({ success: true, focusMessage: data.focusMessage });
   } catch (error: any) {
     console.error('Focus mode activate error:', error);
@@ -1428,10 +1527,7 @@ app.post('/api/agent/check-in', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
 
     // Save notification in Firestore if action is required
     if (userId && data.actionRequired && data.interventionType !== 'no_intervention') {
@@ -1499,10 +1595,7 @@ app.post('/api/tasks/improve', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
     res.json(data);
   } catch (error: any) {
     console.error('Task improve error:', error);
@@ -1566,14 +1659,80 @@ app.all('/api/agent/weekly-review', async (req, res) => {
       }
     });
 
-    if (!response.text) {
-      throw new Error('Empty response from Gemini');
-    }
-    const data = JSON.parse(response.text);
+    const data = parseGeminiText(response.text);
     res.json(data);
   } catch (error: any) {
     console.error('Weekly review agent error:', error);
     res.status(500).json({ error: error.message || 'Failed weekly review generation' });
+  }
+});
+
+// BATCH ENDPOINT: Analyze multiple tasks in a single Gemini call (saves quota)
+app.post('/api/tasks/batch-analyze', async (req, res) => {
+  try {
+    const { tasks, behaviorProfile } = req.body;
+
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      return res.status(400).json({ error: 'tasks array is required' });
+    }
+
+    const taskList = tasks.map((t: any, i: number) =>
+      `${i + 1}. "${t.title}" (difficulty: ${t.difficulty || 'medium'}, category hint: ${t.category || 'auto'})`
+    ).join('\n');
+
+    const prompt = `
+      Analyze these ${tasks.length} tasks and return an analysis array in the same order.
+
+      User behavior context:
+      - Average task duration: ${behaviorProfile?.averageTaskDuration || 30} mins
+      - Strengths: ${JSON.stringify(behaviorProfile?.strengths || [])}
+      - Weaknesses: ${JSON.stringify(behaviorProfile?.weaknesses || [])}
+
+      Tasks to analyze:
+      ${taskList}
+
+      For each task, determine: category (coding/writing/admin/meeting/learning/personal/other), estimatedMinutes (integer), priority (low/medium/high).
+      Return a JSON array with exactly ${tasks.length} objects in the same order as input.
+    `;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            analyses: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  category: { type: 'STRING', enum: ['coding', 'writing', 'admin', 'meeting', 'learning', 'personal', 'other'] },
+                  estimatedMinutes: { type: 'INTEGER' },
+                  priority: { type: 'STRING', enum: ['low', 'medium', 'high'] }
+                },
+                required: ['category', 'estimatedMinutes', 'priority']
+              }
+            }
+          },
+          required: ['analyses']
+        }
+      }
+    });
+
+    const data = parseGeminiText(response.text);
+    res.json(data);
+  } catch (error: any) {
+    if (isRateLimitError(error)) {
+      setIsRateLimited(true);
+      const { tasks } = req.body;
+      return rateLimitedJson(res, {
+        analyses: (tasks || []).map(() => ({ category: 'other', estimatedMinutes: 30, priority: 'medium' }))
+      });
+    }
+    console.error('Batch analyze error:', error);
+    res.status(500).json({ error: error.message || 'Failed batch analysis' });
   }
 });
 

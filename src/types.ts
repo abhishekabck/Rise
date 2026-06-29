@@ -22,7 +22,7 @@ export interface Task {
   scheduledAt?: string; // ISO string
   completedAt?: string; // ISO string
   createdAt: string;    // ISO string
-  category: 'coding' | 'writing' | 'admin' | 'meeting' | 'learning' | 'other';
+  category: 'coding' | 'writing' | 'admin' | 'meeting' | 'learning' | 'personal' | 'other';
   deadline?: string;     // ISO string format
   difficulty?: 'easy' | 'medium' | 'hard';
   recurring?: 'one-time' | 'daily' | 'weekly' | 'monthly';

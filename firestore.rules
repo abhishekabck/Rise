@@ -43,7 +43,7 @@ service cloud.firestore {
       return data.keys().hasAll(['title', 'status', 'createdAt'])
         && data.title is string && data.title.size() <= 500
         && data.status in ['pending', 'in_progress', 'completed', 'abandoned']
-        && (!data.keys().hasAny(['category']) || data.category in ['coding', 'writing', 'admin', 'meeting', 'learning', 'other'])
+        && (!data.keys().hasAny(['category']) || data.category in ['coding', 'writing', 'admin', 'meeting', 'learning', 'personal', 'other'])
         && (!data.keys().hasAny(['difficulty']) || data.difficulty in ['easy', 'medium', 'hard'])
         && (!data.keys().hasAny(['recurring']) || data.recurring in ['one-time', 'daily', 'weekly', 'monthly'])
         && (!data.keys().hasAny(['deadline']) || data.deadline is string);

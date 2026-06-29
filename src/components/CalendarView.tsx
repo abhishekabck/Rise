@@ -41,11 +41,11 @@ export default function CalendarView({ googleAccessToken, onConnectGoogle, tasks
 
   // Interactive views states
   const [viewMode, setViewMode] = useState<ViewMode>('month');
-  const [currentDate, setCurrentDate] = useState(new Date("2026-06-26T10:17:03-07:00")); // Lock to target base or today
-  const [selectedDate, setSelectedDate] = useState(new Date("2026-06-26T10:17:03-07:00"));
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const [selectedDate, setSelectedDate] = useState(new Date());
 
   // Track current system time for the timeline red indicator line
-  const [currentTime, setCurrentTime] = useState(new Date("2026-06-26T10:17:03-07:00"));
+  const [currentTime, setCurrentTime] = useState(new Date());
 
   useEffect(() => {
     // Keep currentTime updated, or static base for mock 2026 dates

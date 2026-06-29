@@ -428,7 +428,7 @@ export default function Dashboard({
   const getDeadlineBadge = (deadlineStr?: string) => {
     if (!deadlineStr) return null;
     const deadlineDate = new Date(deadlineStr);
-    const isTodayDate = deadlineDate.toDateString() === new Date("2026-06-26").toDateString();
+    const isTodayDate = deadlineDate.toDateString() === new Date().toDateString();
     const formatted = deadlineDate.toLocaleDateString([], {
       month: 'short',
       day: 'numeric',

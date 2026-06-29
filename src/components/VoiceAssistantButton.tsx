@@ -4,6 +4,9 @@ import { motion, AnimatePresence } from 'motion/react';
 import { doc, getDoc, setDoc, collection, query, where, getDocs, updateDoc, addDoc } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAIStatus } from '../hooks/useAIStatus';
+import { detectVoiceIntentFast } from '../lib/deterministicChecks';
+import { fallbackVoiceProcessing } from '../lib/voiceFallback';
+import { guardian } from '../lib/quotaGuardian';
 
 interface VoiceAssistantButtonProps {
   userId?: string;
@@ -34,6 +37,7 @@ export default function VoiceAssistantButton({ onCommandResult, userId }: VoiceA
   const recognitionRef = useRef<any>(null);
   const statusTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const finalTranscriptRef = useRef('');
+  const isProcessingCommandRef = useRef(false);
 
   // AI Active / Resting Status
   const aiStatus = useAIStatus();
@@ -156,8 +160,8 @@ export default function VoiceAssistantButton({ onCommandResult, userId }: VoiceA
       setAssistantState('listening');
       setInterimText('');
       finalTranscriptRef.current = '';
+      isProcessingCommandRef.current = false;
       showTemporaryStatus('Listening...', 10000);
-      // Hide tutorial once they start speaking
       setShowTutorial(false);
     };
 
@@ -196,16 +200,33 @@ export default function VoiceAssistantButton({ onCommandResult, userId }: VoiceA
     };
 
     rec.onend = () => {
-      // Only process the FINAL transcript when user stops speaking
+      // Only process the FINAL transcript once — guard against onend firing multiple times
       const textToProcess = finalTranscriptRef.current.trim();
-      if (textToProcess) {
-        if (aiStatus.isResting) {
-          handleProcessVoiceOffline(textToProcess);
-        } else {
-          handleProcessVoice(textToProcess);
-        }
+      if (textToProcess && !isProcessingCommandRef.current) {
+        isProcessingCommandRef.current = true;
         finalTranscriptRef.current = '';
-      } else {
+
+        // Fast path: deterministic intent detection for simple commands (no AI needed)
+        const fastIntent = detectVoiceIntentFast(textToProcess);
+        const useAI = !aiStatus.isResting && guardian.shouldAllow('voiceCommand');
+
+        if (fastIntent && !useAI) {
+          // Simple non-add_task commands can be handled deterministically
+          handleProcessVoiceOffline(textToProcess).finally(() => {
+            isProcessingCommandRef.current = false;
+          });
+        } else if (aiStatus.isResting || !useAI) {
+          // AI resting or quota exhausted → use enhanced offline fallback
+          handleProcessVoiceOffline(textToProcess).finally(() => {
+            isProcessingCommandRef.current = false;
+          });
+        } else {
+          guardian.recordCall('voiceCommand');
+          handleProcessVoice(textToProcess).finally(() => {
+            isProcessingCommandRef.current = false;
+          });
+        }
+      } else if (!textToProcess) {
         setAssistantState('idle');
       }
     };
@@ -226,6 +247,10 @@ export default function VoiceAssistantButton({ onCommandResult, userId }: VoiceA
 
     const lowercase = text.toLowerCase().trim();
     console.log('[Voice Fallback] Processing offline:', lowercase);
+
+    // Use enhanced fallbackVoiceProcessing for intent detection
+    const fallbackResult = fallbackVoiceProcessing(text);
+    console.log('[Voice Fallback] Intent:', fallbackResult.action, 'Confidence:', fallbackResult.confidence);
 
     try {
       const tasksRef = collection(db, `users/${userId}/tasks`);
